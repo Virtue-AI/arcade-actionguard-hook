@@ -26,7 +26,7 @@ ARCADE_API_KEY = os.environ["ARCADE_API_KEY"]
 ARCADE_USER_ID = os.environ["ARCADE_USER_ID"]
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 
-# Server IDs as registered in Arcade Dashboard → Servers
+# Server IDs as registered in Arcade Dashboard
 MCP_SERVER_IDS = ["gmail-mcp", "paypal-mcp"]
 
 MODEL = "gemini-3-pro-preview"

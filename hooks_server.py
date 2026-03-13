@@ -124,7 +124,7 @@ async def pre_execution_hook(request: Request, authorization: str | None = Heade
     """
     Called by Arcade before every tool execution.
     """
-    # Use the bearer token Arcade sends (ACTION_GUARD_JWT) to authenticate with Action Guard
+    # Use the bearer token Arcade sends (VIRTUE_AGENT_JWT) to authenticate with Action Guard
     auth_token = ""
     if authorization:
         _, _, auth_token = authorization.partition(" ")
