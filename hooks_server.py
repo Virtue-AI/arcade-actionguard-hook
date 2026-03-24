@@ -2,6 +2,7 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 import httpx
 from dotenv import load_dotenv
@@ -9,7 +10,7 @@ from fastapi import FastAPI, Header, Request
 
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("hooks_server")
 
 # ─── Config ──────────────────────────────────────────────────────────────────
@@ -17,6 +18,31 @@ log = logging.getLogger("hooks_server")
 ACTION_GUARD_URL       = os.environ["ACTION_GUARD_URL"]
 ACTION_GUARD_POLICY_ID = os.environ["ACTION_GUARD_POLICY_ID"]
 FAST_MODE            = os.environ.get("ACTION_GUARD_FAST_MODE", "false").lower() == "true"
+ACTION_GUARD_JWT       = os.environ["ACTION_GUARD_JWT"]
+
+# MCP Gateway logging (for Virtue Dashboard trajectory)
+VIRTUE_DASHBOARD_URL   = os.environ.get("VIRTUE_DASHBOARD_URL", "https://agentgateway.virtueai.io")
+GATEWAY_JWT            = os.environ.get("GATEWAY_JWT", ACTION_GUARD_JWT)
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REQUEST_LOG_DIR = os.path.join(SCRIPT_DIR, "logs", "requests")
+os.makedirs(REQUEST_LOG_DIR, exist_ok=True)
+
+
+def _save_request(hook: str, execution_id: str, headers: dict, body: dict):
+    """Dump the full incoming request (headers + body) to a JSON file for debugging."""
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    record = {
+        "timestamp": ts,
+        "hook": hook,
+        "headers": headers,
+        "body": body,
+    }
+    path = os.path.join(REQUEST_LOG_DIR, f"{ts}_{hook}_{execution_id}.json")
+    with open(path, "w") as f:
+        json.dump(record, f, indent=2, default=str)
+    log.debug("[%s] saved full request to %s", hook, path)
+
 
 # ─── HTTP client ─────────────────────────────────────────────────────────────
 
@@ -112,6 +138,73 @@ def build_session_history(
         "trajectory": trajectory,
     }
 
+# ─── Gateway logging ─────────────────────────────────────────────────────────
+
+async def _log_tool_event(
+    event_type: str,
+    session_id: str,
+    tool_name: str,
+    tool_params: dict | None = None,
+    server_name: str = "Arcade",
+    server_id: str = "arcade-mcp",
+    user_query: str | None = None,
+    result: object = None,
+    guard_info: dict | None = None,
+    gateway_id: str = "arcade",
+):
+    """Fire-and-forget call to MCP Gateway log-tool-event endpoint."""
+    payload = {
+        "event_type": event_type,
+        "session_id": session_id,
+        "tool_name": tool_name,
+        "server_name": server_name,
+        "server_id": server_id,
+    }
+    if gateway_id:
+        payload["gateway_id"] = gateway_id
+    if tool_params is not None:
+        payload["tool_params"] = tool_params
+    if user_query:
+        payload["user_query"] = user_query
+    if result is not None:
+        payload["result"] = result
+    if guard_info:
+        payload["guard_info"] = guard_info
+
+    try:
+        resp = await _http.post(
+            f"{VIRTUE_DASHBOARD_URL}/api/log-tool-event",
+            headers={"Authorization": f"Bearer {GATEWAY_JWT}"},
+            json=payload,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        log.info("[log] %s logged → session=%s step=%s", event_type, data.get("session_id"), data.get("step_id"))
+    except Exception as exc:
+        log.warning("[log] Failed to log %s: %s", event_type, exc)
+
+
+def _build_guard_info(guard_result: dict, hook: str) -> dict:
+    """Convert Action Guard response into the guard_info format for session storage."""
+    action_guard = {
+        "allowed": guard_result.get("allowed", True),
+        "checked": True,
+    }
+    if guard_result.get("violations"):
+        action_guard["violations"] = guard_result["violations"]
+    if guard_result.get("explanation"):
+        action_guard["explanation"] = guard_result["explanation"]
+    if guard_result.get("threat_category"):
+        action_guard["threat_category"] = guard_result["threat_category"]
+    if guard_result.get("policy_id"):
+        action_guard["policy_id"] = guard_result["policy_id"]
+
+    return {
+        "access_control": {"allowed": True, "checked": False},
+        "action_guard": action_guard,
+    }
+
+
 # ─── Endpoints ───────────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -124,7 +217,7 @@ async def pre_execution_hook(request: Request, authorization: str | None = Heade
     """
     Called by Arcade before every tool execution.
     """
-    # Use the bearer token Arcade sends (VIRTUE_AGENT_JWT) to authenticate with Action Guard
+    # Extract Arcade's header token for debug logging (not used for Action Guard auth)
     auth_token = ""
     if authorization:
         _, _, auth_token = authorization.partition(" ")
@@ -140,6 +233,7 @@ async def pre_execution_hook(request: Request, authorization: str | None = Heade
     user_id      = context.get("user_id", "unknown")
 
     log.info("[pre] execution_id=%s user=%s tool=%s_%s", execution_id, user_id, toolkit, tool)
+    _save_request("pre", execution_id, dict(request.headers), body)
 
     session_history = build_session_history(toolkit, tool, inputs, context)
 
@@ -153,7 +247,7 @@ async def pre_execution_hook(request: Request, authorization: str | None = Heade
     try:
         resp = await _http.post(
             f"{ACTION_GUARD_URL}/api/v1/guard_actions",
-            headers={"Authorization": f"Bearer {auth_token}"},
+            headers={"Authorization": f"Bearer {ACTION_GUARD_JWT}"},
             json=payload,
         )
         resp.raise_for_status()
@@ -170,6 +264,21 @@ async def pre_execution_hook(request: Request, authorization: str | None = Heade
     allowed     = result.get("allowed", True)
     explanation = result.get("explanation", "")
     violations  = result.get("violations", [])
+
+    # Log tool_call to MCP Gateway for Virtue Dashboard trajectory
+    tool_full = f"{toolkit}_{tool}" if toolkit else tool
+    guard_info = _build_guard_info(result, "pre")
+    session_id = request.headers.get("x-session-id", execution_id)
+    arcade_meta = context.get("metadata", {})
+    user_query = arcade_meta.get("user_query") if arcade_meta else None
+    await _log_tool_event(
+        event_type="tool_call",
+        session_id=session_id,
+        tool_name=tool_full,
+        tool_params=inputs,
+        user_query=user_query,
+        guard_info=guard_info,
+    )
 
     if not allowed:
         reason = explanation or "; ".join(violations[:3]) or "policy violation"
@@ -204,6 +313,7 @@ async def post_execution_hook(request: Request, authorization: str | None = Head
 
     log.info("[post] execution_id=%s user=%s tool=%s_%s success=%s",
              execution_id, user_id, toolkit, tool, success)
+    _save_request("post", execution_id, dict(request.headers), body)
 
     if exec_error:
         log.warning("[post] execution_error=%s", exec_error[:200])
@@ -223,7 +333,7 @@ async def post_execution_hook(request: Request, authorization: str | None = Head
     try:
         resp = await _http.post(
             f"{ACTION_GUARD_URL}/api/v1/guard_actions",
-            headers={"Authorization": f"Bearer {auth_token}"},
+            headers={"Authorization": f"Bearer {ACTION_GUARD_JWT}"},
             json=payload,
         )
         resp.raise_for_status()
@@ -240,6 +350,18 @@ async def post_execution_hook(request: Request, authorization: str | None = Head
     allowed     = result.get("allowed", True)
     explanation = result.get("explanation", "")
     violations  = result.get("violations", [])
+
+    # Log tool_result to MCP Gateway for Virtue Dashboard trajectory
+    tool_full = f"{toolkit}_{tool}" if toolkit else tool
+    guard_info = _build_guard_info(result, "post")
+    session_id = request.headers.get("x-session-id", execution_id)
+    await _log_tool_event(
+        event_type="tool_result",
+        session_id=session_id,
+        tool_name=tool_full,
+        result=output,
+        guard_info=guard_info,
+    )
 
     if not allowed:
         reason = explanation or "; ".join(violations[:3]) or "policy violation"
