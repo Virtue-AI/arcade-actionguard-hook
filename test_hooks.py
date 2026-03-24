@@ -10,7 +10,7 @@ load_dotenv()
 HOOKS_URL = os.environ.get("HOOKS_URL", "https://virtue-action-guard-arcade-hook.ngrok.io")
 BEARER_TOKEN = os.environ.get("BEARER_TOKEN", os.environ.get("VIRTUE_AGENT_JWT", ""))
 USER_ID = os.environ.get("ARCADE_USER_ID")
-SESSION_ID = "langchain-agent-12345"
+SESSION_ID = "langchain-agent-123"
 
 HEADERS = {"Content-Type": "application/json", "X-Session-Id": SESSION_ID}
 
